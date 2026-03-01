@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+
+# This script takes a path to a video file as an argument,
+# as well as start and end times,
+# and extracts the specified segment from the video using ffmpeg
+# It saves the extracted segment as a temporary file and prints the path to this file.
+
+usage() {
+  cat <<EOF
+Usage: $0 [options] -f <video_file>
+Options:
+  -f <video_file>     Path to the input video file (required)
+  -s <start_time>     Start time of the segment to extract (format: HH:MM:SS or seconds). Default is (start) of video.
+  -e <end_time>       End time of the segment to extract (format: HH:MM:SS or seconds). Default is (end) of video.
+  -o <output_file>    Path to save the extracted segment. If not provided, a temporary file will be created.
+  -y                  Automatically overwrite output file if it exists without prompting.
+  -n                  If output file exists, do not overwrite and exit with error.
+  -h, --help          Show this help message and exit.
+EOF
+  exit 1
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Default values
+video_file=""
+start_time="start"
+end_time="end"
+output_file=""
+default_yes="ask"
+
+# Parse command-line arguments with getopts
+while getopts ":f:s:e:o:ynh-:" opt; do
+  case $opt in
+  f) video_file="$OPTARG" ;;
+  s) start_time="$OPTARG" ;;
+  e) end_time="$OPTARG" ;;
+  o) output_file="$OPTARG" ;;
+  y) default_yes="yes" ;;
+  n) default_yes="no" ;;
+  h) usage ;;
+  -)
+    case $OPTARG in
+    help) usage ;;
+    *)
+      echo "Invalid option: --$OPTARG" >&2
+      usage
+      ;;
+    esac
+    ;;
+  \?)
+    echo "Invalid option: -$OPTARG" >&2
+    usage
+    ;;
+  :)
+    echo "Option -$OPTARG requires an argument." >&2
+    usage
+    ;;
+  esac
+done
+
+# Check if video file is provided
+if [ ! -f "$video_file" ]; then
+  echo "Error: video file not found or not specified." >&2
+  usage >&2
+fi
+
+video_file_ext="${video_file##*.}"
+
+# Check if output file is specified
+temp_file_created=false
+if [ -f "$output_file" ]; then
+  if [ "$default_yes" = "no" ]; then
+    echo "Error: Output file '$output_file' already exists." >&2
+    exit 1
+  elif [ "$default_yes" = "ask" ]; then
+    read -p "Output file '$output_file' already exists. Overwrite? (y/N): " choice
+    # Evaluate user choice
+    # Lowercase the input for easier comparison
+    choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
+    case "$choice" in
+    y | yes) ;;
+    *)
+      echo "Operation cancelled."
+      exit 1
+      ;;
+    esac
+  fi
+elif [ -z "$output_file" ]; then
+  output_file=$(mktemp --suffix=".${video_file_ext}")
+  temp_file_created=true
+fi
+
+# Build ffmpeg command based on arguments
+ffmpeg_ss=""
+ffmpeg_to=""
+if [ "$start_time" != "start" ]; then
+  ffmpeg_ss="-ss $start_time"
+fi
+if [ "$end_time" != "end" ]; then
+  ffmpeg_to="-to $end_time"
+fi
+
+# Copy the entire video file if no start or end time is provided
+if [ -z "$ffmpeg_ss" ] && [ -z "$ffmpeg_to" ]; then
+  cp "$video_file" "$output_file"
+  if [ $? -ne 0 ]; then
+    echo "Error: failed to copy video file" >&2
+    if [ "$temp_file_created" = true ]; then
+      rm -f "$output_file"
+    fi
+    exit 1
+  fi
+else
+  # Extract the specified segment using ffmpeg
+  ffmpeg $ffmpeg_ss $ffmpeg_to -i "$video_file" -map 0 -c copy -y "$output_file"
+  if [ $? -ne 0 ]; then
+    echo "Error: ffmpeg failed to extract video segment" >&2
+    if [ "$temp_file_created" = true ]; then
+      rm -f "$output_file"
+    fi
+    exit 1
+  fi
+fi
+
+# Print the path to the output file
+echo "Saved to: "
+echo "$output_file"
+exit 0

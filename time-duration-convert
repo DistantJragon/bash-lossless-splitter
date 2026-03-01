@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+
+# This script converts between the two ffmpeg time durations syntaxes.
+# [-][HH:]MM:SS[.m...]
+# [-]S+[.m...][s|ms|us]
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options] DURATION
+Convert between ffmpeg time duration syntaxes.
+Options:
+  -s              Convert to seconds format (S+[.m...]s)
+  -S              Convert to seconds format without suffix (S+[.m...])
+  -m              Convert to milliseconds format (S+[.m...]ms)
+  -u              Convert to microseconds format (S+[.m...]us)
+  -M              Convert to [HH:]MM:SS.mmm format
+  -H              Convert to HH:MM:SS.mmm format
+  -h, --help      Show this help message and exit
+
+Note: Long durations may result in overflows.
+      In the worst case, converting to microseconds on a 32-bit system limits the maximum duration to less than an hour.
+      Use a format with colons or the seconds format and deal with the decimal part if necessary.
+EOF
+  exit 1
+}
+
+convert_format="S"
+
+# Default precision is microseconds
+# This should stay 6 or else the script will need to be modified
+precision=6
+
+while getopts ":sSmuMHh-:" opt; do
+  case $opt in
+  s) convert_format="s" ;;
+  S) convert_format="S" ;;
+  m) convert_format="m" ;;
+  u) convert_format="u" ;;
+  M) convert_format="M" ;;
+  H) convert_format="H" ;;
+  h) usage ;;
+  -)
+    case $OPTARG in
+    help) usage ;;
+    *)
+      echo "Unknown option --$OPTARG" >&2
+      usage
+      ;;
+    esac
+    ;;
+  \?)
+    # Check if it's a number (positional argument)
+    if [[ "$OPTARG" =~ ^[0-9]+$ ]]; then
+      break
+    fi
+    echo "Unknown option -$OPTARG" >&2
+    usage
+    ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# Convert the input duration to total hours, minutes, and microseconds
+# (Keeping track of just microseconds would be simpler, but would limit 32-bit systems
+# to less than an hour of duration)
+# If there are colons in the input, it's in [HH:]MM:SS[.m...] format
+# Else, it's in S+[.m...][s|ms|us] format, and we need to look at the suffix
+input_duration="$1"
+input_microseconds=0
+input_seconds=0
+input_minutes=0
+input_hours=0
+
+can-number-survive-bash-arithmetic() {
+  local num="$1"
+  if [[ "$((num))" != "$num" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+remove-leading-zeros() {
+  local num="$1"
+  # Remove leading zeros
+  num="$(sed 's/^0\+\([0-9]\)/\1/' <<<"$num")"
+  # If empty, it's zero
+  if [[ -z "$num" ]]; then
+    num="0"
+  fi
+  echo "$num"
+}
+
+remove-trailing-zeros() {
+  local num="$1"
+  # Remove trailing zeros
+  num="$(sed 's/\([0-9]\)0\+$/\1/' <<<"$num")"
+  # If empty, it's zero
+  if [[ -z "$num" ]]; then
+    num="0"
+  fi
+  echo "$num"
+}
+
+pad-with-zeros() {
+  local num="$1"
+  local target_length="$2"
+  # Use printf
+  printf "%0${target_length}d" "$num"
+}
+
+# Extract negative sign if present
+negative=0
+if [[ "$input_duration" == -* ]]; then
+  negative=1
+  input_duration="${input_duration:1}"
+fi
+
+if [[ "$input_duration" == *:* ]]; then
+  # [HH:]MM:SS[.m...]
+  IFS=':' read -r -a time_parts <<<"$input_duration"
+  num_parts=${#time_parts[@]}
+  if ((num_parts < 2 || num_parts > 3)); then
+    echo "Invalid time format: $input_duration" >&2
+    exit 1
+  fi
+  seconds_part="${time_parts[num_parts - 1]}"
+  minutes_part="${time_parts[num_parts - 2]}"
+  hours_part=0
+  if ((num_parts == 3)); then
+    hours_part="${time_parts[0]}"
+  fi
+
+  IFS='.' read -r input_seconds fraction <<<"$seconds_part"
+  fraction=${fraction:-0}
+
+  # Extract microseconds from fraction
+  fraction_length=${#fraction}
+  if ((fraction_length > precision)); then
+    fraction=${fraction:0:precision}
+    fraction_length=precision
+  else
+    fraction=$((fraction * 10 ** (precision - fraction_length)))
+  fi
+  input_microseconds=$(remove-leading-zeros "$fraction")
+  input_seconds=$(remove-leading-zeros "$input_seconds")
+  input_minutes=$(remove-leading-zeros "$minutes_part")
+  input_hours=$(remove-leading-zeros "$hours_part")
+elif [[ "$input_duration" =~ ^([0-9]+)(\.([0-9]+))?(s|ms|us)?$ ]]; then
+  # S+[.m...][s|ms|us]
+  whole="${BASH_REMATCH[1]}"
+  fraction="${BASH_REMATCH[3]}"
+  suffix="${BASH_REMATCH[4]}"
+  fraction=${fraction:-0}
+
+  # Digit shift according to suffix
+  digit_shift=0
+  case $suffix in
+  us) digit_shift=6 ;;
+  ms) digit_shift=3 ;;
+  s | "") digit_shift=0 ;;
+  *)
+    echo "Invalid time format: $input_duration" >&2
+    exit 1
+    ;;
+  esac
+
+  # Take the end of the whole part and put it in fraction according to digit shift
+  if ((digit_shift != 0)); then
+    whole=$(pad-with-zeros "$whole" $((digit_shift + 1)))
+    extra_fraction="${whole: -digit_shift}"
+    whole="${whole:0:-digit_shift}"
+    whole=$(remove-leading-zeros "$whole")
+    if ! can-number-survive-bash-arithmetic "$whole"; then
+      echo "Number too large: $input_duration" >&2
+      exit 1
+    fi
+    fraction="$extra_fraction$fraction"
+  fi
+  fraction_length=${#fraction}
+  if ((fraction_length > precision)); then
+    fraction=${fraction:0:precision}
+    fraction_length=precision
+  else
+    fraction=$((fraction * 10 ** (precision - fraction_length)))
+  fi
+  input_microseconds=$(remove-leading-zeros "$fraction")
+  input_seconds=$((whole % 60))
+  input_minutes=$(((whole % 3600) / 60))
+  input_hours=$((whole / 3600))
+else
+  echo "Invalid time format: $input_duration" >&2
+  exit 1
+fi
+
+if [[ $negative -eq 1 ]]; then
+  printf '-'
+fi
+
+if [[ $convert_format == "M" || $convert_format == "H" ]]; then
+  if [[ $convert_format == "H" || $input_hours -gt 0 ]]; then
+    printf '%d:' "$input_hours"
+  fi
+  printf '%02d:' "$input_minutes"
+  if ((input_microseconds == 0)); then
+    printf '%02d\n' "$input_seconds"
+  else
+    printf -v seconds_with_fraction '%02d.%06d' "$input_seconds" "$input_microseconds"
+    printf '%s\n' "$(remove-trailing-zeros "$seconds_with_fraction")"
+  fi
+  exit 0
+fi
+
+digit_shift=0
+case $convert_format in
+s | S) digit_shift=0 ;;
+m) digit_shift=3 ;;
+u) digit_shift=6 ;;
+esac
+
+output_whole=$((input_hours * 3600 + input_minutes * 60 + input_seconds))
+output_fraction=$(pad-with-zeros "$input_microseconds" $precision)
+if ((digit_shift > 0)); then
+  extra_whole="${output_fraction:0:digit_shift}"
+  output_fraction="${output_fraction:digit_shift}"
+  output_whole="$output_whole$extra_whole"
+fi
+output_fraction=$(remove-trailing-zeros "$output_fraction")
+printf '%s' "$output_whole"
+if [[ -n "$output_fraction" && "$output_fraction" != "0" ]]; then
+  printf '.%s' "$output_fraction"
+fi
+case $convert_format in
+s) printf 's' ;;
+m) printf 'ms' ;;
+u) printf 'us' ;;
+esac
+printf '\n'
+exit 0

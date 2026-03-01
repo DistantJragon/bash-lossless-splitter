@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/djn-video-trimmer"
+if ! mkdir -p "$CONFIG_DIR"; then
+  echo "Error creating config directory: $CONFIG_DIR" >&2
+  exit 1
+fi
+readonly SCRIPT_DIR CONFIG_DIR
+
+trimmer_script="${SCRIPT_DIR}/trimmer"
+parse_size_script="${SCRIPT_DIR}/parse-size"
+size_filter_script="${SCRIPT_DIR}/size-filter"
+duration_convert_script="${SCRIPT_DIR}/time-duration-convert"
+readonly trimmer_script parse_size_script size_filter_script duration_convert_script
+
+# This is an interactive script. If the user wants to automatically trim videos without interaction,
+# they would be better off using a different script.
+# Check if stdin is a terminal
+if [ ! -t 0 ]; then
+  echo "This script requires an interactive terminal." >&2
+  exit 1
+fi
+
+usage() {
+  cat <<EOF
+Usage: $0 [options] [<video_file1> <video_file2> ...]
+  <video_file>:        Path(s) to the input video file(s) to be trimmed.
+  -d <directory>:      Directory to scan for video files to process. (Overrides files provided as arguments)
+  -e <extensions>:     Comma-separated list of video file extensions to process if no files are provided as arguments.
+                       Default is 'mp4,mkv,avi'.
+  -F:                  Disables all filtering and sorting of input video files.
+  -I:                  Automatically open each input file for preview before trimming.
+  -n <name_scheme>:    Naming scheme for output files. Use {file} as placeholder for original filename,
+                       {idx} for segment index, and {ext} for file extension.
+                       Default is '{file}_trimmed_{idx}.{ext}'.
+  -N:                  Use original filename for output files (Overrides -n and forces single segment output).
+  -o <directory>:      Directory to place trimmed video segments. Default is current directory.
+  -O:                  Overwrite the existing video files (Overrides -o and implies -N).
+  -p <player_command>: Command to use for previewing video files. Default is 'xdg-open'.
+  -s <sorting_method>: Sorting method for video segments before processing.
+                       Options are 'name' (default),  'duration', or 'size'.
+  -t <duration>:       Set the threshold duration (in seconds) for trimming video segments.
+  -V:                  Automatically preview each trimmed segment after creation.
+  -z <size>:           Set the minimum size for video segments to be trimmed.
+  -h, --help:          Show this help message and exit.
+
+Note: This script writes temporary files to a temporary directory during execution.
+      Thus, the script may write a large amount of data to RAM. Be sure to set TMPDIR if necessary.
+EOF
+  exit 1
+}
+
+# Default values
+input_dir=""
+extensions=("mp4" "mkv" "avi")
+auto_preview_input="no"
+filtering_enabled="yes"
+name_scheme="{file}_trimmed_{idx}.{ext}"
+original_filename="no"
+output_dir="."
+overwrite_existing="no"
+player_command="xdg-open"
+sorting_method="name"
+duration_threshold="0"
+auto_preview_trimmed="no"
+size_threshold="0"
+
+# Parse command-line arguments with getopts
+while getopts ":d:e:FIn:No:Op:s:t:Vz:h-:" opt; do
+  case $opt in
+  d) input_dir="$OPTARG" ;;
+  e)
+    unset extensions
+    if ! IFS=',' read -r -a extensions <<<"$OPTARG"; then
+      echo "Error reading extensions." >&2
+      usage
+    fi
+    ;;
+  F) filtering_enabled="no" ;;
+  I) auto_preview_input="yes" ;;
+  n) name_scheme="$OPTARG" ;;
+  N) original_filename="yes" ;;
+  o) output_dir="$OPTARG" ;;
+  O)
+    overwrite_existing="yes"
+    original_filename="yes"
+    ;;
+  p) player_command="$OPTARG" ;;
+  s)
+    lower_optarg=$(echo "$OPTARG" | tr '[:upper:]' '[:lower:]')
+    case $lower_optarg in
+    name | duration | size) sorting_method="$lower_optarg" ;;
+    *)
+      echo "Invalid sorting method: $OPTARG" >&2
+      usage
+      ;;
+    esac
+    ;;
+  t) duration_threshold="$OPTARG" ;;
+  V) auto_preview_trimmed="yes" ;;
+  z)
+    if ! size_threshold=$("$parse_size_script" "$OPTARG"); then
+      echo "Error parsing size threshold: $OPTARG" >&2
+      usage
+    fi
+    ;;
+  h) usage ;;
+  -)
+    case $OPTARG in
+    help) usage ;;
+    *)
+      echo "Invalid option: --$OPTARG" >&2
+      usage
+      ;;
+    esac
+    ;;
+  \?)
+    echo "Invalid option: -$OPTARG" >&2
+    usage
+    ;;
+  :)
+    echo "Option -$OPTARG requires an argument." >&2
+    usage
+    ;;
+  esac
+done
+shift $((OPTIND - 1))
+readonly player_command
+
+# If no files are provided and no input directory is specified, scan current directory
+if (($# == 0)) && [[ -z "$input_dir" ]]; then
+  input_dir="."
+fi
+
+video_files=()
+if [[ -n "$input_dir" ]]; then
+  for ext in "${extensions[@]}"; do
+    while IFS= read -r -d $'\0' file; do
+      video_files+=("$file")
+    done < <(find "$input_dir" -maxdepth 1 -type f -iname "*.${ext}" -print0)
+  done
+else
+  video_files=("$@")
+fi
+
+if ((${#video_files[@]} == 0)); then
+  echo "No video files found to process." >&2
+  usage
+fi
+
+if [[ "$overwrite_existing" == "no" ]]; then
+  if ! mkdir -p "$output_dir"; then
+    echo "Error creating output directory: $output_dir" >&2
+    exit 1
+  fi
+fi
+
+sorted_files=()
+if [[ "$filtering_enabled" == "yes" ]]; then
+  mapfile -t -d $'\0' sorted_files < <(
+    printf '%s\0' "${video_files[@]}" | "$size_filter_script" -s "$size_threshold" -t "$duration_threshold" -S "$sorting_method"
+  )
+else
+  sorted_files=("${video_files[@]}")
+fi
+unset video_files
+
+if ! script_temp_dir="$(mktemp -d -p "" "video-trimmer-djn.XXXXXX")"; then
+  echo "Error creating temporary directory." >&2
+  exit 1
+fi
+readonly script_temp_dir
+
+enter-alternate-terminal-buffer() {
+  printf '\e[?1049h'
+}
+
+exit-alternate-terminal-buffer() {
+  printf '\e[?1049l'
+}
+
+cleanup() {
+  exit-alternate-terminal-buffer
+  rm -r "$script_temp_dir"
+}
+
+trap 'cleanup' EXIT
+enter-alternate-terminal-buffer
+
+user-select-from-list() {
+  if (($# < 2)); then
+    echo "user-select-from-list requires at least a prompt and one option." >&2
+    return 1
+  fi
+  local output_index="no"
+  local check_option="$1"
+  if [[ "$check_option" == "-i" ]]; then
+    output_index="yes"
+    shift
+  fi
+  if (($# < 2)); then
+    echo "user-select-from-list requires at least a prompt and one option." >&2
+    return 1
+  fi
+  local prompt="$1"
+  shift
+  local options=("$@")
+  local options_count=${#options[@]}
+  local choice
+  while true; do
+    clear
+    echo "$prompt" >/dev/tty
+    for ((i = 0; i < options_count; i++)); do
+      echo "  $((i + 1))) ${options[i]}" >/dev/tty
+    done
+    echo "  q) Cancel" >/dev/tty
+    read -rp "Enter your choice: " choice >/dev/tty
+    if [[ "$choice" == "q" ]]; then
+      echo "q"
+      return 2
+    elif ! [[ "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > options_count)); then
+      echo "Invalid choice. Please try again." >/dev/tty
+      read -n 1 -s -r -p "Press any key to continue..." >/dev/tty
+      echo >/dev/tty
+    else
+      if [[ "$output_index" == "yes" ]]; then
+        echo $((choice - 1))
+      else
+        echo "${options[$((choice - 1))]}"
+      fi
+      return
+    fi
+  done
+}
+
+print-user-choices() {
+  cat <<EOF
+Options:
+  1) Add trim segment
+  2) Remove trim segment
+  3) Clear all trim segments
+  4) Preview video file
+  5) Preview trimmed segment
+  6) Preview all trimmed segments sequentially
+  7) Finalize and trim video file
+  0) Skip to next video file
+  q) Quit script
+EOF
+}
+
+create-new-temp-trim-file() {
+  local video_file="$1"
+  local trim_start="$2"
+  local trim_end="$3"
+  local trim_temp_file
+  if ! trim_temp_file="$(mktemp -p "$script_temp_dir" "segment-XXXXXX.${video_file##*.}")"; then
+    echo "Error creating temporary file for trimmed segment." >&2
+    return 1
+  fi
+  if ! "$trimmer_script" -s "$trim_start" -e "$trim_end" -o "$trim_temp_file" -y -f "$video_file" >/dev/null; then
+    echo "Error trimming segment." >&2
+    rm "$trim_temp_file"
+    return 1
+  fi
+  echo "$trim_temp_file"
+}
+
+for video_file in "${sorted_files[@]}"; do
+  if [[ ! -f "$video_file" ]]; then
+    echo "File not found: $video_file" >&2
+    read -n 1 -s -r -p "Press any key to continue..."
+    echo
+    continue
+  fi
+  file_previewed="no"
+  # Trim segments array, scheme start_seconds,start_user,end,temp_file
+  trim_segments=()
+  user_done_file="no"
+  while [[ "$user_done_file" == "no" ]]; do
+    clear
+    echo -e "Processing file:\n$video_file"
+    echo "Current trim segments:"
+    num_trim_segments=${#trim_segments[@]}
+    if ((num_trim_segments == 0)); then
+      echo "  (none)"
+    else
+      # Sort segments by start time (first field)
+      mapfile -t -d $'\0' new_trim_segments < <(
+        printf '%s\0' "${trim_segments[@]}" | sort -z -t',' -k1,1n
+      )
+      trim_segments=("${new_trim_segments[@]}")
+      unset new_trim_segments
+      for ((i = 0; i < num_trim_segments; i++)); do
+        # Print [start] to [end]
+        IFS=',' read -r _ trim_start trim_end _ <<<"${trim_segments[i]}"
+        echo "  $trim_start to $trim_end"
+      done
+    fi
+    if [[ "$auto_preview_input" == "yes" && "$file_previewed" == "no" ]]; then
+      $player_command "$video_file"
+      file_previewed="yes"
+    fi
+    echo
+    print-user-choices
+    read -r -p "Enter your choice : " user_choice
+    echo
+    case $user_choice in
+    1)
+      # Add trim segment
+      if ((num_trim_segments > 0)) && [[ "$original_filename" == "yes" ]]; then
+        echo "Cannot add multiple segments when using original filename for output." >&2
+        read -n 1 -s -r -p "Press any key to continue..."
+        echo
+        continue
+      fi
+      read -rp "Enter start time (FFmpeg format, default is start of video): " start_time
+      read -rp "Enter end time (FFmpeg format, default is end of video): " end_time
+      if [[ -z "$start_time" ]]; then
+        start_time_s="0"
+        start_time="start"
+      else
+        if ! start_time_s=$("$duration_convert_script" -S "$start_time"); then
+          echo "Error parsing start time to seconds: $start_time" >&2
+          read -n 1 -s -r -p "Press any key to continue..."
+          echo
+          continue
+        fi
+        if ! start_time="$("$duration_convert_script" -M "$start_time")"; then
+          echo "Error parsing start time: $start_time" >&2
+          read -n 1 -s -r -p "Press any key to continue..."
+          echo
+          continue
+        fi
+      fi
+      if [[ -z "$end_time" ]]; then
+        end_time="end"
+      else
+        if ! end_time=$("$duration_convert_script" -M "$end_time"); then
+          echo "Error parsing end time: $end_time" >&2
+          read -n 1 -s -r -p "Press any key to continue..."
+          echo
+          continue
+        fi
+      fi
+      trim_temp_file=""
+      if [[ "$auto_preview_trimmed" == "yes" ]]; then
+        if ! trim_temp_file="$(create-new-temp-trim-file "$video_file" "$start_time" "$end_time")"; then
+          read -n 1 -s -r -p "Press any key to continue..."
+          echo
+          continue
+        fi
+        $player_command "$trim_temp_file"
+      fi
+      trim_segments+=("$start_time_s,$start_time,$end_time,$trim_temp_file")
+      num_trim_segments=${#trim_segments[@]}
+      ;;
+    2)
+      # Remove trim segment
+      if ((num_trim_segments == 0)); then
+        echo "No trim segments to remove."
+        read -n 1 -s -r -p "Press any key to continue..."
+        echo
+        continue
+      fi
+      if ((num_trim_segments == 1)); then
+        selected_segment=0
+      else
+        selected_segment=$(user-select-from-list -i "Select a segment to remove:" "${trim_segments[@]}")
+        select_result=$?
+        if ((select_result == 1)); then
+          echo "Error selecting segment." >&2
+          read -n 1 -s -r -p "Press any key to continue..."
+          echo
+          continue
+        elif ((select_result == 2)); then
+          continue
+        fi
+      fi
+      # Build new trim_segments array without the selected segment
+      new_trim_segments=()
+      for ((i = 0; i < num_trim_segments; i++)); do
+        if ((i != selected_segment)); then
+          new_trim_segments+=("${trim_segments[i]}")
+        else
+          # Remove temporary file if it exists
+          IFS=',' read -r _ _ _ trim_temp_file <<<"${trim_segments[i]}"
+          if [[ -n "$trim_temp_file" && -f "$trim_temp_file" ]]; then
+            rm "$trim_temp_file"
+          fi
+        fi
+      done
+      trim_segments=("${new_trim_segments[@]}")
+      num_trim_segments=${#trim_segments[@]}
+      unset new_trim_segments
+      ;;
+    3)
+      # Clear all trim segments
+      # Remove temporary files if they exist
+      for ((i = 0; i < num_trim_segments; i++)); do
+        segment="${trim_segments[i]}"
+        IFS=',' read -r _ _ _ trim_temp_file <<<"$segment"
+        if [[ -n "$trim_temp_file" && -f "$trim_temp_file" ]]; then
+          rm "$trim_temp_file"
+        fi
+      done
+      trim_segments=()
+      ;;
+    4)
+      # Preview video file
+      $player_command "$video_file"
+      file_previewed="yes"
+      ;;
+    5)
+      # Preview trimmed segment
+      if ((${#trim_segments[@]} == 0)); then
+        echo "No trim segments to preview."
+        read -n 1 -s -r -p "Press any key to continue..."
+        echo
+        continue
+      fi
+      if [[ ${#trim_segments[@]} -eq 1 ]]; then
+        selected_segment=0
+      else
+        echo "Select a segment to preview:"
+        selected_segment=$(user-select-from-list -i "Select a segment to preview:" "${trim_segments[@]}")
+        select_result=$?
+        if ((select_result == 1)); then
+          echo "Error selecting segment." >&2
+          read -n 1 -s -r -p "Press any key to continue..."
+          echo
+          continue
+        elif ((select_result == 2)); then
+          continue
+        fi
+      fi
+      IFS=',' read -r _ trim_start trim_end trim_temp_file <<<"${trim_segments[selected_segment]}"
+      if [[ -n "$trim_temp_file" && -f "$trim_temp_file" ]]; then
+        $player_command "$trim_temp_file"
+      else
+        if ! new_trim_temp="$(create-new-temp-trim-file "$video_file" "$trim_start" "$trim_end")"; then
+          read -n 1 -s -r -p "Press any key to continue..."
+          echo
+          continue
+        fi
+        cut_trim_segment="$(echo "${trim_segments[selected_segment]}" | cut -d',' -f1-3)"
+        trim_segments[selected_segment]="${cut_trim_segment},${new_trim_temp}"
+        $player_command "$new_trim_temp"
+      fi
+      ;;
+    6)
+      # Preview all trimmed segments sequentially
+      if ((num_trim_segments == 0)); then
+        echo "No trim segments to preview."
+        read -n 1 -s -r -p "Press any key to continue..."
+        echo
+        continue
+      fi
+      for ((i = 0; i < num_trim_segments; i++)); do
+        IFS=',' read -r _ trim_start trim_end trim_temp_file <<<"${trim_segments[i]}"
+        if [[ -n "$trim_temp_file" && -f "$trim_temp_file" ]]; then
+          $player_command "$trim_temp_file"
+        else
+          if ! new_trim_temp="$(create-new-temp-trim-file "$video_file" "$trim_start" "$trim_end")"; then
+            read -n 1 -s -r -p "Press any key to continue..."
+            echo
+            continue 2
+          fi
+          trim_segments[i]="${trim_start},${trim_end},${new_trim_temp}"
+          $player_command "$new_trim_temp"
+        fi
+        read -n 1 -s -r -p "Press any key to continue to the next segment..."
+        echo
+      done
+      ;;
+    7)
+      # Finalize and trim video file
+      if ((num_trim_segments == 0)); then
+        echo "No trim segments defined. Please add at least one segment." >&2
+        read -n 1 -s -r -p "Press any key to continue..."
+        echo
+        continue
+      fi
+      if ((num_trim_segments > 1)) && [[ "$original_filename" == "yes" ]]; then
+        echo "Cannot output multiple segments when using original filename for output." >&2
+        read -n 1 -s -r -p "Press any key to continue..."
+        echo
+        continue
+      fi
+      for ((i = 0; i < num_trim_segments; i++)); do
+        IFS=',' read -r _ trim_start trim_end trim_temp_file <<<"${trim_segments[i]}"
+        if [[ -z "$trim_temp_file" || ! -f "$trim_temp_file" ]]; then
+          if ! new_trim_temp="$(create-new-temp-trim-file "$video_file" "$trim_start" "$trim_end")"; then
+            read -n 1 -s -r -p "Press any key to continue..."
+            echo
+            continue 2
+          fi
+          trim_temp_file="$new_trim_temp"
+        fi
+        # Determine output file name
+        if [[ "$overwrite_existing" == "yes" ]]; then
+          output_file="$video_file"
+        elif [[ "$original_filename" == "yes" ]]; then
+          output_file="$output_dir/$(basename "$video_file")"
+        else
+          file_base="$(basename "$video_file")"
+          file_name="${file_base%.*}"
+          file_ext="${file_base##*.}"
+          output_file="${name_scheme//\{file\}/$file_name}"
+          output_file="${output_file//\{idx\}/$((i + 1))}"
+          output_file="${output_file//\{ext\}/$file_ext}"
+          output_file="$output_dir/$output_file"
+        fi
+        if [[ -f "$output_file" && "$overwrite_existing" == "no" ]]; then
+          echo "Error: Output file '$output_file' already exists." >&2
+          read -r -p "Overwrite? (y/N): " choice
+          choice=$(echo "$choice" | tr '[:upper:]' '[:lower:]')
+          case "$choice" in
+          y | yes) ;;
+          *)
+            echo "Skipping segment."
+            continue
+            ;;
+          esac
+        fi
+        mv "$trim_temp_file" "$output_file"
+      done
+      user_done_file="yes"
+      ;;
+    0)
+      # Skip to next video file
+      for ((i = 0; i < num_trim_segments; i++)); do
+        IFS=',' read -r _ _ _ trim_temp_file <<<"${trim_segments[i]}"
+        if [[ -n "$trim_temp_file" && -f "$trim_temp_file" ]]; then
+          rm "$trim_temp_file"
+        fi
+      done
+      user_done_file="yes"
+      ;;
+    q)
+      # Quit script
+      exit 0
+      ;;
+    *)
+      echo "Invalid choice. Please try again." >&2
+      read -n 1 -s -r -p "Press any key to continue..."
+      echo
+      ;;
+    esac
+  done
+done

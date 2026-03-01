@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+# A wrapper script for the trimmer script to handle simple previewing of trimmed files
+# and overwriting the original files if desired.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TRIMMER_SCRIPT="$SCRIPT_DIR/trimmer"
+
+usage() {
+  cat <<EOF
+Usage: $0 [options] <video_file>
+Options:
+  -p <previewer>      Video player command to preview the trimmed video (default: xdg-open)
+  -I                  Preview the input video file before trimming
+  -h, --help          Show this help message and exit.
+EOF
+  exit 1
+}
+
+# Default values
+previewer="xdg-open"
+preview_input="no"
+
+# Parse command-line arguments
+while getopts ":p:Ih-:" opt; do
+  case $opt in
+  p) previewer="$OPTARG" ;;
+  I) preview_input="yes" ;;
+  h) usage ;;
+  -)
+    case $OPTARG in
+    help) usage ;;
+    *)
+      echo "Invalid option: --$OPTARG" >&2
+      usage
+      ;;
+    esac
+    ;;
+  \?)
+    echo "Invalid option: -$OPTARG" >&2
+    usage
+    ;;
+  :)
+    echo "Option -$OPTARG requires an argument." >&2
+    usage
+    ;;
+  esac
+done
+shift $((OPTIND - 1))
+video_file="$1"
+
+if [ ! -f "$video_file" ]; then
+  echo "Error: Video file is required." >&2
+  usage
+fi
+
+video_file_ext="${video_file##*.}"
+
+# Preview the input video file if requested
+if [ "$preview_input" == "yes" ]; then
+  echo "Previewing input video file: $video_file"
+  "$previewer" "$video_file"
+fi
+
+# Prompt user for trim times
+read -p "Enter start time (FFmpeg format, default is start of video): " start_time
+read -p "Enter end time (FFmpeg format, default is end of video): " end_time
+
+if [ -z "$start_time" ]; then
+  start_time="start"
+fi
+if [ -z "$end_time" ]; then
+  end_time="end"
+fi
+
+# Create a temporary output file
+temp_output_file="$(mktemp --suffix=".${video_file_ext}")"
+trap 'rm -f "$temp_output_file"' EXIT
+
+# Call the trimmer script with the provided arguments and the temporary output file
+"$TRIMMER_SCRIPT" -f "$video_file" -s "$start_time" -e "$end_time" -o "$temp_output_file" -y
+if [ $? -ne 0 ]; then
+  echo "Trimming failed." >&2
+  exit 1
+fi
+echo "Trimming completed. Previewing trimmed video."
+"$previewer" "$temp_output_file"
+
+# Ask user if they want to overwrite the original file
+read -p "Do you want to overwrite the original file '$video_file' with the trimmed version? (y/N): " overwrite_choice
+overwrite_choice=$(echo "$overwrite_choice" | tr '[:upper:]' '[:lower:]')
+case "$overwrite_choice" in
+y | yes)
+  mv "$temp_output_file" "$video_file"
+  echo "Original file '$video_file' has been overwritten with the trimmed version."
+  ;;
+*)
+  echo "Operation cancelled. Original file remains unchanged."
+  ;;
+esac

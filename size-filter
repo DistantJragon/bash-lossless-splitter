@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+
+# This script reads from stdin a list of files and filters and sorts them based on size or duration.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+parse_size_script="${SCRIPT_DIR}/parse-size"
+readonly SCRIPT_DIR parse_size_script
+
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+  -S <sorting_method>: Sorting method for video files. Options are 'name' (default), 'duration', or 'size'.
+  -s <size>:           Set the minimum size for video files to be included.
+  -t <duration>:       Set the minimum duration (in seconds) for video files to be included.
+  -h, --help:          Show this help message and exit.
+EOF
+  exit 1
+}
+
+# Default values
+sorting_method="name"
+size_threshold="0"
+duration_threshold="0"
+
+# Parse command-line arguments with getopts
+while getopts ":s:S:t:h-:" opt; do
+  case $opt in
+  s)
+    if ! size_threshold=$("$parse_size_script" "$OPTARG"); then
+      echo "Invalid size format: $OPTARG" >&2
+      usage
+    fi
+    ;;
+  S) sorting_method="$OPTARG" ;;
+  t) duration_threshold="$OPTARG" ;;
+  h) usage ;;
+  -)
+    case $OPTARG in
+    help) usage ;;
+    *)
+      echo "Invalid option: --$OPTARG" >&2
+      usage
+      ;;
+    esac
+    ;;
+  \?)
+    echo "Invalid option: -$OPTARG" >&2
+    usage
+    ;;
+  :)
+    echo "Option -$OPTARG requires an argument." >&2
+    usage
+    ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# Check if stdin is a terminal
+if [ -t 0 ]; then
+  echo "This script requires input via stdin." >&2
+  exit 1
+fi
+
+# Check if we need to check size or duration
+# (if thresholds are greater than 0 or sort is by size/duration)
+check_size="n"
+check_duration="n"
+if ((size_threshold > 0)) || [ "$sorting_method" = "size" ]; then
+  check_size="y"
+fi
+if ((duration_threshold > 0)) || [ "$sorting_method" = "duration" ]; then
+  check_duration="y"
+fi
+
+prepend-and-filter() {
+  local file="$1"
+  local size duration
+  if [[ "$check_size" == "y" ]]; then
+    size=$(stat -c%s "$file" 2>/dev/null || echo -1)
+    if ((size < size_threshold)); then
+      return
+    fi
+  else
+    size=0
+  fi
+  if [[ "$check_duration" == "y" ]]; then
+    duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null)
+    if [[ -z "$duration" ]]; then
+      duration=0
+    fi
+    duration=$(printf "%.0f" "$duration")
+    if ((duration < duration_threshold)); then
+      return
+    fi
+  else
+    duration=0
+  fi
+  printf '%d\t%d\t%s\0' "$size" "$duration" "$file"
+}
+
+sort_options=("-z" "-t"$'\t')
+case $sorting_method in
+size) sort_options+=("-k1,1nr") ;;
+duration) sort_options+=("-k2,2nr") ;;
+# Sort by name, everything past the 2nd tab character
+name) sort_options+=("-k3") ;;
+*)
+  echo "Invalid sorting method: $sorting_method" >&2
+  usage >&2
+  ;;
+esac
+
+# DEBUG
+# check_size="y"
+# check_duration="y"
+
+# Read and process each file from stdin via pipes
+while IFS= read -r -d $'\0' file; do
+  prepend-and-filter "$file"
+done |
+  sort "${sort_options[@]}" |
+  cut -f3- -d $'\t' -z

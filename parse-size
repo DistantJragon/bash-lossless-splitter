@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# Need to extract number and unit from input string
+# Unit can be b, kb, kib, mb, mib, etc.
+# Empty unit implies bytes
+input_size="$1"
+if [[ $input_size =~ ^([0-9]+)([a-zA-Z]{0,3})$ ]]; then
+  number_part="${BASH_REMATCH[1]}"
+  unit_part=$(echo "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')
+  first_char="${unit_part:0:1}"
+  exponent=0
+  case $first_char in
+  k)
+    exponent=1
+    ;;
+  m)
+    exponent=2
+    ;;
+  g)
+    exponent=3
+    ;;
+  t)
+    exponent=4
+    ;;
+  b)
+    exponent=0
+    ;;
+  "")
+    exponent=0
+    ;;
+  *)
+    echo "Invalid size unit: $unit_part" >&2
+    exit 1
+    ;;
+  esac
+  # Check for 'i' in the unit to determine if it's binary
+  base_bytes=1000
+  if [[ $unit_part == *i ]]; then
+    base_bytes=1024
+  fi
+  multiplier=$((base_bytes ** exponent))
+  total_size=$((number_part * multiplier))
+  echo "$total_size"
+  exit 0
+else
+  echo "Invalid size format: $input_size" >&2
+  exit 1
+fi
